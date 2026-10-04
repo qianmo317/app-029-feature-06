@@ -10,7 +10,8 @@
     "minTrackMm": -20,
     "maxTrackMm": 300,
     "warnTrackRatioLow": 0.04,
-    "warnTrackRatioHigh": 0.35
+    "warnTrackRatioHigh": 0.35,
+    "remnantMinSideMm": 100
   },
   "acrylicSheets": [
     {

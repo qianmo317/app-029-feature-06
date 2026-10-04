@@ -7,8 +7,16 @@ import testchars from '../data/testchars.json'
 import { computeLed } from './led'
 import { clearGeometryCache, ensureFont, findFont, getGlyphGeom } from './fontLoader'
 import { computeLayout, defaultProject, textToItems, type LayoutResult } from './layout'
-import { assertBomSum, buildBom, compareMaterials, defaultPreset, type Preset } from './materials'
-import { nestPieces, type Piece } from './nesting'
+import { assertBomSum, buildBom, compareMaterials, defaultPreset, remnantFitPieces, yuan, type Preset } from './materials'
+import { nestPieces, nestWithStock, pieceFits, type Piece } from './nesting'
+import {
+  deleteRemnant,
+  getRemnant,
+  listRemnants,
+  markRemnantUsed,
+  registerLeftovers,
+  remnantFingerprint
+} from './remnants'
 import { runBlockCount, type BlockCountResult } from './testRunner'
 import type { LayoutDef, Project } from './types'
 import type { Ring } from './geometry'
@@ -375,6 +383,141 @@ export async function runAcceptance(preset: Preset = defaultPreset): Promise<Acc
       pass: cmp.every((c) => c.totalCents === c.panelCents + c.ledCents + c.psuCents + c.accessoryCents + c.laborCents),
       detail: `${cmp.length} 种材质`,
       evidence: cmp.map((c) => `${c.name}：面板 ${(c.panelCents / 100).toFixed(2)} + LED ${(c.ledCents / 100).toFixed(2)} + 电源 ${(c.psuCents / 100).toFixed(2)} + 配件 ${(c.accessoryCents / 100).toFixed(2)} + 加工 ${(c.laborCents / 100).toFixed(2)} = ¥${(c.totalCents / 100).toFixed(2)}`)
+    })
+  }
+
+  // ---------- 11. 余料登记、选用、核销与计价 ----------
+  {
+    const ev: string[] = []
+    const fails: string[] = []
+    const createdIds: string[] = []
+    const mk = (n: number, w: number, h: number): Piece[] =>
+      Array.from({ length: n }, (_, i) => ({ id: `r${i}`, label: `件${i + 1}`, wMm: w, hMm: h }))
+    const sheet = preset.acrylicSheets[0]
+
+    // 11.1 拼版后提取边角：3 件 600×600 上 1220×2440 → 每层右侧条带 + 底部余料
+    const res = nestWithStock(mk(3, 600, 600), sheet.wMm, sheet.hMm, sheet.kerfMm, true, [], sheet.spec, preset.process.remnantMinSideMm)
+    const board = res.sheets[0]
+    const regs = registerLeftovers({
+      sheet,
+      boardIndex: 0,
+      boardsTotal: 1,
+      projectId: 'acc11',
+      projectName: '余料自检',
+      regions: board.leftovers ?? []
+    })
+    createdIds.push(...regs.added.map((r) => r.id))
+    const bottom = (board.leftovers ?? []).find((r) => Math.abs(r.x) < 1e-9 && r.wMm === sheet.wMm)
+    ev.push(
+      `3 件 600×600：登记余料 ${regs.added.length} 块：${regs.added
+        .map((r) => `${r.code} ${Math.round(r.wMm)}×${Math.round(r.hMm)}@(${Math.round(r.xMm)},${Math.round(r.yMm)})`)
+        .join('、')}`
+    )
+    if (!regs.added.length || !bottom) fails.push('整板边角未登记或底部余料缺失')
+
+    // 11.2 碎料标记：层间锯缝条必须在 scraps 里
+    if (!(board.scraps ?? []).length) fails.push('层间锯缝条未标为不可再裁碎料')
+    else ev.push(`碎料标记 ${(board.scraps ?? []).length} 处（层间锯缝条等，不登记）`)
+
+    // 11.3 重复登记去重：同来源板/位置/尺寸再来一次，必须 0 新增且全部判重
+    const again = registerLeftovers({
+      sheet,
+      boardIndex: 0,
+      boardsTotal: 1,
+      projectId: 'acc11',
+      projectName: '余料自检',
+      regions: board.leftovers ?? []
+    })
+    if (again.added.length !== 0 || again.duplicates.length !== (board.leftovers ?? []).length)
+      fails.push('同一块料重复登记未被识别')
+    ev.push(`同批边角再登记一次：新增 ${again.added.length}，识别重复 ${again.duplicates.length}（期望 0 / ${(board.leftovers ?? []).length}）`)
+    if (regs.added[0]) {
+      const fpSame = remnantFingerprint({
+        sheetSpecId: sheet.id,
+        boardIndex: 0,
+        projectId: 'acc11',
+        x: regs.added[0].xMm,
+        y: regs.added[0].yMm,
+        w: regs.added[0].wMm,
+        h: regs.added[0].hMm
+      })
+      if (fpSame !== regs.added[0].fingerprint) fails.push('指纹复算不一致')
+    }
+
+    // 11.4 够不够裁以锯缝后实际尺寸为准（含旋转）
+    if (!bottom) {
+      fails.push('跳过余料选用判定（无底部余料）')
+    } else {
+      const fitsDirect = pieceFits({ id: 'a', label: 'a', wMm: 600, hMm: 1200 }, bottom.wMm, bottom.hMm, sheet.kerfMm, true)
+      // 597 宽 + 锯缝 3 = 570 宽余料的临界：bottom 宽 1220 不受限；改用右侧条带 617 宽验证
+      const strip = (board.leftovers ?? []).find((r) => Math.abs(r.wMm - 617) < 1e-9)
+      const crit = strip
+        ? pieceFits({ id: 'b', label: 'b', wMm: 614, hMm: 400 }, strip.wMm, strip.hMm, sheet.kerfMm, true) &&
+          !pieceFits({ id: 'c', label: 'c', wMm: 615, hMm: 400 }, strip.wMm, strip.hMm, sheet.kerfMm, true)
+        : false
+      const rotate = pieceFits({ id: 'd', label: 'd', wMm: bottom.hMm - sheet.kerfMm, hMm: 500 }, bottom.wMm, bottom.hMm, sheet.kerfMm, true)
+      if (!fitsDirect || !crit || !rotate) fails.push('锯缝/旋转判定口径错误')
+      ev.push(
+        `判定口径 piece+锯缝≤实际尺寸：600×1200 入 ${Math.round(bottom.wMm)}×${Math.round(bottom.hMm)}=${fitsDirect}；` +
+          (strip ? `614 宽临界入 617=${crit}（615 应裁不下）；` : '') +
+          `可转 90°=${rotate}`
+      )
+      const rows = remnantFitPieces({ wMm: strip?.wMm ?? bottom.wMm, hMm: strip?.hMm ?? bottom.hMm }, res.cutList, sheet.kerfMm)
+      ev.push(`余料够切件说明：${rows.filter((r) => r.fits).map((r) => r.label).join('、') || '无'}（${rows.find((r) => r.fits)?.reason ?? '全部裁不下'}）`)
+
+      // 11.5 选余料开料：登记一块等同整板大小的余料，3 件 500×400 应全部排上，0 开新板
+      const big = registerLeftovers({
+        sheet,
+        boardIndex: 9,
+        boardsTotal: 1,
+        projectId: 'acc11-stock',
+        projectName: '余料自检库存',
+        regions: [{ x: 0, y: 0, wMm: sheet.wMm, hMm: sheet.hMm }]
+      }).added[0]
+      if (big) createdIds.push(big.id)
+      const withStock = nestWithStock(mk(3, 500, 400), sheet.wMm, sheet.hMm, sheet.kerfMm, true, big ? [{ id: big.id, code: big.code, wMm: big.wMm, hMm: big.hMm }] : [], sheet.spec)
+      if (withStock.fullSheetCount !== 0 || withStock.stockBoardCount !== 1 || withStock.stockUses.length !== 1)
+        fails.push('余料板开料数量/耗用统计错误')
+      ev.push(`用余料 ${big?.code} 开 3 件 500×400：新整板 ${withStock.fullSheetCount} 张、余料板 ${withStock.stockBoardCount} 块、耗用 ${(withStock.stockUses[0]?.areaM2 ?? 0).toFixed(3)}㎡`)
+
+      // 11.6 BOM 计价：余料部分只按用掉面积折算，不按整张
+      const p11 = makeProject('acc11b', '广告', 300)
+      const lay11 = computeLayout(p11.layout, { autoSize: true })
+      const bomStock = buildBom(p11, lay11, preset, { stockRemnants: big ? [getRemnant(big.id)!].filter(Boolean) : [] })
+      const acrylicRow = bomStock.materials.find((m) => m.kind === 'acrylic' && m.unit === '㎡')
+      const fullRow = bomStock.materials.find((m) => m.kind === 'acrylic' && m.unit === '张')
+      if (bomStock.nesting.stockBoardCount > 0) {
+        if (!acrylicRow || acrylicRow.amountCents >= sheet.priceCents) fails.push('余料未按实际耗用面积计价（仍按整张）')
+        if (fullRow) fails.push('全部用余料时仍计了整板费用')
+        ev.push(
+          `BOM 亚克力：余料行 ${acrylicRow ? `${acrylicRow.qty}㎡×${yuan(acrylicRow.unitPriceCents)}元/㎡=${yuan(acrylicRow.amountCents)}元` : '缺'}；` +
+            `整板价 ${yuan(sheet.priceCents)} 元，余料金额 < 整张`
+        )
+      }
+
+      // 11.7 核销：标已用完后不可再选；localStorage 可读回
+      if (big) {
+        markRemnantUsed(big.id)
+        const used = getRemnant(big.id)
+        if (used?.status === 'used') {
+          const reBom = buildBom(p11, lay11, preset, { stockRemnants: [used] })
+          if (reBom.nesting.stockBoardCount !== 0) fails.push('已用完余料仍被选去开料')
+          ev.push('标记已用完后该余料不再参与开料；记录仍在本机存储可恢复')
+        } else fails.push('核销状态未持久化')
+      }
+    }
+
+    // 清理自检产生的库存，避免污染真实余料库
+    for (const id of createdIds) deleteRemnant(id)
+    if (listRemnants().some((r) => r.sourceProject === '余料自检' || r.sourceProject === '余料自检库存'))
+      fails.push('自检余料未清理干净')
+
+    checks.push({
+      id: 'A11',
+      title: '余料：边角登记（溯源/去重/碎料标记）、按锯缝实际尺寸判定选用、核销与按耗用面积计价、本机持久化',
+      pass: fails.length === 0,
+      detail: fails.length ? fails.join('；') : '通过',
+      evidence: ev
     })
   }
 

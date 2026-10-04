@@ -6,6 +6,7 @@ import { buildQuoteDoc, exportQuoteXls, exportProcessCardCsv } from '../logic/qu
 import { assertBomSum, buildBom, compareMaterials, yuan } from '../logic/materials'
 import { alignLabel, mountingLabel } from '../logic/layout'
 import { getProject } from '../logic/store'
+import { listRemnants, type Remnant } from '../logic/remnants'
 import { useSession } from '../logic/useSession'
 import type { Project } from '../logic/types'
 
@@ -19,8 +20,16 @@ const ack = ref(false)
 const mode = ref<'quote' | 'card'>('quote')
 const printed = ref(false)
 
+const stockRemnants = computed<Remnant[]>(() => {
+  const ids = project.value?.stockRemnantIds ?? []
+  if (!ids.length) return []
+  return listRemnants().filter((r) => ids.includes(r.id) && r.status === 'available' && r.sheetSpecId === project.value?.sheetId)
+})
+
 const bom = computed(() =>
-  project.value && layout.value ? buildBom(project.value, layout.value, preset.value, { acknowledgeThinStroke: ack.value }) : null
+  project.value && layout.value
+    ? buildBom(project.value, layout.value, preset.value, { acknowledgeThinStroke: ack.value, stockRemnants: stockRemnants.value })
+    : null
 )
 const fontLabel = computed(() => {
   const p = project.value
@@ -168,7 +177,7 @@ function toCsv(): void {
               {{ bom.led.suggestedPsu }}
             </span>
             <span class="muted">亚克力</span>
-            <span class="mono">{{ bom.sheet.spec }} · {{ bom.nesting.sheetCount }} 张 · 利用率 {{ (bom.nesting.utilization * 100).toFixed(1) }}%</span>
+            <span class="mono">{{ bom.sheet.spec }} · 新开整板 {{ bom.nesting.fullSheetCount }} 张 · 余料板 {{ bom.nesting.stockBoardCount }} 块 · 利用率 {{ (bom.nesting.utilization * 100).toFixed(1) }}%</span>
           </div>
 
           <h3 style="margin-top: 12px">字形工艺分析</h3>

@@ -8,8 +8,9 @@
 import materialsData from '../data/materials.json'
 import type { LedResult, Material, Project } from './types'
 import type { LayoutResult, PlacedChar } from './layout'
-import { nestPieces, type CutItem, type NestingResult, type Piece } from './nesting'
+import { nestWithStock, pieceFits, type CutItem, type NestingResult, type Piece, type StockBoardInput } from './nesting'
 import { computeLed, type PsuPreset } from './led'
+import type { Remnant } from './remnants'
 
 export interface SheetSpec {
   id: string
@@ -75,6 +76,8 @@ export interface Preset {
     maxTrackMm: number
     warnTrackRatioLow: number
     warnTrackRatioHigh: number
+    /** 余料登记最小边长：小于该值的空余不登记，只标碎料 */
+    remnantMinSideMm: number
   }
   acrylicSheets: SheetSpec[]
   ledModules: LedModuleSpec[]
@@ -100,11 +103,37 @@ export interface BomResult {
   blocked: boolean
   blockReasons: string[]
   panelMaterial: PanelMaterialSpec
+  /** 亚克力板材费用拆分：整板按张、余料按实际耗用面积折算 */
+  acrylic: AcrylicCost
+}
+
+/** 余料开料的费用明细：用掉那块算那块，绝不按整张板计 */
+export interface RemnantCostLine {
+  remnantId: string
+  remnantCode: string
+  spec: string
+  usedAreaM2: number
+  unitPriceCentsPerM2: number
+  amountCents: number
+}
+
+export interface AcrylicCost {
+  fullSheetCount: number
+  fullSheetSpec: string
+  fullSheetPriceCents: number
+  fullSheetAmountCents: number
+  remnantLines: RemnantCostLine[]
+  remnantAmountCents: number
+  totalCents: number
+  /** 计价口径说明（界面/报价单照此写明） */
+  note: string
 }
 
 export interface BomOptions {
   /** 已确认「最细笔画低于工艺下限」的风险 */
   acknowledgeThinStroke?: boolean
+  /** 选中的登记余料（作为板材候选，按顺序先排余料再开新板） */
+  stockRemnants?: Remnant[]
 }
 
 function ruleQty(rule: RuleSpec, ctx: { areaM2: number; chars: number; perimeterM: number; psu: number; modules: number; blocks: number; outlinePerimeterM: number }): number {
@@ -160,7 +189,21 @@ export function buildBom(project: Project, layout: LayoutResult, preset: Preset,
   const led = computeLed(layout.ledLengthMm, project.led, preset.psu)
 
   const pieces = acrylicPieces(layout.chars)
-  const nesting = nestPieces(pieces, sheet.wMm, sheet.hMm, sheet.kerfMm, true)
+  // 选中的余料只取「可用、同板规格同厚度」，已用完/已删除的静默不参与
+  const stockRemnants = (opts.stockRemnants ?? []).filter(
+    (r) => r.status === 'available' && r.sheetSpecId === sheet.id && r.thicknessMm === sheet.thicknessMm
+  )
+  const stock: StockBoardInput[] = stockRemnants.map((r) => ({ id: r.id, code: r.code, wMm: r.wMm, hMm: r.hMm }))
+  const nesting = nestWithStock(
+    pieces,
+    sheet.wMm,
+    sheet.hMm,
+    sheet.kerfMm,
+    true,
+    stock,
+    sheet.spec,
+    preset.process.remnantMinSideMm ?? 100
+  )
   const pieceAreaM2 = nesting.totalPieceAreaMm2 / 1e6
   const outerPerimeterMm = layout.chars.reduce((s, c) => {
     const k = c.geom.inkW > 0 ? c.inkW / c.geom.inkW : 0
@@ -186,15 +229,28 @@ export function buildBom(project: Project, layout: LayoutResult, preset: Preset,
   }
 
   const materials: Material[] = []
-  // 1) 亚克力面板（按板计）
-  materials.push({
-    kind: 'acrylic',
-    spec: sheet.spec,
-    qty: nesting.sheetCount,
-    unit: '张',
-    unitPriceCents: sheet.priceCents,
-    amountCents: nesting.sheetCount * sheet.priceCents
-  })
+  // 1) 亚克力面板：整板按张；余料只按「用掉那块的面积」折算，不按整张板计
+  const acrylic = buildAcrylicCost(sheet, nesting)
+  if (acrylic.fullSheetCount > 0) {
+    materials.push({
+      kind: 'acrylic',
+      spec: `${sheet.spec}（新整板）`,
+      qty: acrylic.fullSheetCount,
+      unit: '张',
+      unitPriceCents: sheet.priceCents,
+      amountCents: acrylic.fullSheetAmountCents
+    })
+  }
+  for (const line of acrylic.remnantLines) {
+    materials.push({
+      kind: 'acrylic',
+      spec: `余料 ${line.remnantCode}（${line.spec}）按实际耗用 ${line.usedAreaM2.toFixed(4)}㎡ 计`,
+      qty: Number(line.usedAreaM2.toFixed(4)),
+      unit: '㎡',
+      unitPriceCents: line.unitPriceCentsPerM2,
+      amountCents: line.amountCents
+    })
+  }
   // 2) LED 模组
   if (panelMaterial.useLed) {
     materials.push({
@@ -284,8 +340,72 @@ export function buildBom(project: Project, layout: LayoutResult, preset: Preset,
     outlinePerimeterM,
     blocked,
     blockReasons,
-    panelMaterial
+    panelMaterial,
+    acrylic
   }
+}
+
+/**
+ * 亚克力板材费用：
+ * - 新开整板：按张 × 板单价；
+ * - 选中余料：单价 = 来源板单价 ÷ 板面积（分/㎡），金额 = 该单价 × 本块实际耗用面积（料件外接矩形），
+ *   即「用掉的那块算钱」，绝不按整张板计；金额取整数分。
+ */
+export function buildAcrylicCost(sheet: SheetSpec, nesting: NestingResult): AcrylicCost {
+  const sheetAreaM2 = (sheet.wMm * sheet.hMm) / 1e6
+  const pricePerM2 = sheetAreaM2 > 0 ? Math.round(sheet.priceCents / sheetAreaM2) : 0
+  const remnantLines: RemnantCostLine[] = nesting.stockUses.map((u) => {
+    const usedAreaM2 = Math.round(u.areaM2 * 1e4) / 1e4
+    return {
+      remnantId: u.remnantId,
+      remnantCode: u.remnantCode ?? '',
+      spec: `${Math.round(u.wMm)}×${Math.round(u.hMm)}mm`,
+      usedAreaM2,
+      unitPriceCentsPerM2: pricePerM2,
+      amountCents: Math.round(pricePerM2 * usedAreaM2)
+    }
+  })
+  const fullSheetAmount = nesting.fullSheetCount * sheet.priceCents
+  const remnantAmount = remnantLines.reduce((s, l) => s + l.amountCents, 0)
+  return {
+    fullSheetCount: nesting.fullSheetCount,
+    fullSheetSpec: sheet.spec,
+    fullSheetPriceCents: sheet.priceCents,
+    fullSheetAmountCents: fullSheetAmount,
+    remnantLines,
+    remnantAmountCents: remnantAmount,
+    totalCents: fullSheetAmount + remnantAmount,
+    note:
+      nesting.stockBoardCount > 0
+        ? `新整板 ${nesting.fullSheetCount} 张按整张计 ¥${(fullSheetAmount / 100).toFixed(2)}；余料 ${nesting.stockBoardCount} 块只按实际耗用面积 × ${(
+            pricePerM2 / 100
+          ).toFixed(2)} 元/㎡ 计 ¥${(remnantAmount / 100).toFixed(2)}（不按整张板计）`
+        : `新整板 ${nesting.fullSheetCount} 张按整张计 ¥${(fullSheetAmount / 100).toFixed(2)}`
+  }
+}
+
+/**
+ * 判定一批料件中哪些能用某块余料裁出（含锯缝、允许转 90°）。
+ * 口径：按锯缝后的实际尺寸 pieceFits 判定；返回每个可裁料件（含其需要数量）。
+ */
+export function remnantFitPieces(
+  remnant: { wMm: number; hMm: number },
+  cutList: CutItem[],
+  kerf: number
+): Array<{ label: string; wMm: number; hMm: number; count: number; fits: boolean; reason: string }> {
+  return cutList.map((c) => {
+    const fits = pieceFits({ id: '', label: c.label, wMm: c.wMm, hMm: c.hMm }, remnant.wMm, remnant.hMm, kerf, true)
+    const rotated = fits && c.wMm + kerf > remnant.wMm && c.hMm + kerf <= remnant.wMm
+    return {
+      ...c,
+      fits,
+      reason: fits
+        ? rotated
+          ? `${c.wMm}×${c.hMm}mm 转 90° 后 +锯缝${kerf}mm 可裁入 ${Math.round(remnant.wMm)}×${Math.round(remnant.hMm)}mm`
+          : `${c.wMm}×${c.hMm}mm +锯缝${kerf}mm 可直接裁入 ${Math.round(remnant.wMm)}×${Math.round(remnant.hMm)}mm`
+        : `${c.wMm}×${c.hMm}mm 即使转向，加锯缝${kerf}mm 后仍超出 ${Math.round(remnant.wMm)}×${Math.round(remnant.hMm)}mm，裁不下`
+    }
+  })
 }
 
 /** 断言：Σ 材料金额 = 合计，且金额均为整数分 */

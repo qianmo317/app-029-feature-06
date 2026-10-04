@@ -125,6 +125,8 @@ export interface Project {
   /** 面板材料预设 id（见 materials.json 的 panelMaterials） */
   panelMaterialId: string
   sheetId: string
+  /** 本项目开料时优先使用的登记余料 id（作为板材候选） */
+  stockRemnantIds?: string[]
   ledModuleId: string
   createdAt: number
   updatedAt: number

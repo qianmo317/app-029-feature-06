@@ -66,7 +66,12 @@ export function buildQuoteDoc(project: Project, layout: LayoutResult, bom: BomRe
     total: yuan(bom.totalCents),
     notes: [
       `面板材料：${bom.panelMaterial.name}（${bom.panelMaterial.desc}）`,
-      `亚克力拼版：${bom.nesting.sheetCount} 张 ${bom.sheet.spec}，利用率 ${(bom.nesting.utilization * 100).toFixed(1)}%`,
+      bom.nesting.stockBoardCount > 0
+        ? `亚克力拼版：新开整板 ${bom.nesting.fullSheetCount} 张 ${bom.sheet.spec}，另用登记余料 ${bom.nesting.stockBoardCount} 块；余料部分只按实际耗用面积计价，不按整张板计（综合利用率 ${(bom.nesting.utilization * 100).toFixed(1)}%）`
+        : `亚克力拼版：${bom.nesting.sheetCount} 张 ${bom.sheet.spec}，利用率 ${(bom.nesting.utilization * 100).toFixed(1)}%`,
+      ...(bom.acrylic.remnantLines.length
+        ? [bom.acrylic.note]
+        : []),
       `LED：布点长度 ${bom.led.perimeterTotalMm}mm，模组 ${bom.led.modules} 只，额定功率 ${bom.led.ratedW}W，建议电源 ${bom.led.suggestedPsu}`,
       bom.led.note
     ].filter((s) => !!s),
@@ -158,7 +163,13 @@ export function exportProcessCardCsv(project: Project, layout: LayoutResult, bom
   lines.push('')
   lines.push('亚克力拼版')
   lines.push(`板材,${bom.sheet.spec}`)
-  lines.push(`板数,${bom.nesting.sheetCount}`)
+  lines.push(`新开整板,${bom.nesting.fullSheetCount}`)
+  lines.push(`使用余料板,${bom.nesting.stockBoardCount}`)
+  if (bom.nesting.stockBoardCount > 0) {
+    for (const line of bom.acrylic.remnantLines) {
+      lines.push(`余料${line.remnantCode}（${line.spec}）,实际耗用${line.usedAreaM2.toFixed(4)}㎡,金额${yuan(line.amountCents)}元（不按整张板计）`)
+    }
+  }
   lines.push(`利用率,${(bom.nesting.utilization * 100).toFixed(1)}%`)
   download(`${project.name || '招牌'}工艺卡.csv`, new Blob([`\ufeff${lines.join('\n')}`], { type: 'text/csv;charset=utf-8' }))
 }

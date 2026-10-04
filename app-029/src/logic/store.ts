@@ -6,11 +6,13 @@
 import materialsData from '../data/materials.json'
 import type { Preset } from './materials'
 import { defaultProject } from './layout'
+import type { Remnant } from './remnants'
 import type { Project } from './types'
 
 const KEY_PROJECTS = 'app029.projects.v1'
 const KEY_PRESET = 'app029.preset.v1'
 const KEY_PREFS = 'app029.prefs.v1'
+const KEY_REMNANTS = 'app029.remnants.v1'
 
 export interface Prefs {
   defaultFontId: string
@@ -127,4 +129,48 @@ export function savePrefs(p: Partial<Prefs>): Prefs {
   const next = { ...loadPrefs(), ...p }
   writeJson(KEY_PREFS, next)
   return next
+}
+
+// ---------- 余料（边角料）库存：本机 localStorage 持久化，下次打开可读回 ----------
+
+export function loadRemnants(): Remnant[] {
+  const list = readJson<Remnant[]>(KEY_REMNANTS, [])
+  // 容错：旧数据缺状态字段时补 available，避免坏数据导致余料不可用
+  return list.map((r) => ({ ...r, status: r.status ?? ('available' as const) }))
+}
+
+export function saveRemnants(list: Remnant[]): void {
+  writeJson(KEY_REMNANTS, list)
+}
+
+/** 追加登记余料（去重由 remnants.ts 负责），返回保存后的全量列表 */
+export function addRemnants(added: Remnant[]): Remnant[] {
+  const list = loadRemnants()
+  list.push(...added)
+  saveRemnants(list)
+  return list
+}
+
+export function updateRemnant(next: Remnant): Remnant[] {
+  const list = loadRemnants().map((r) => (r.id === next.id ? next : r))
+  saveRemnants(list)
+  return list
+}
+
+/** 用一块余料消费后的结果替换原块：删除原块，写入扣减后的余料（可 0~2 条） */
+export function replaceRemnant(consumedId: string, next: Remnant[]): Remnant[] {
+  const list = loadRemnants().filter((r) => r.id !== consumedId)
+  list.push(...next)
+  saveRemnants(list)
+  return list
+}
+
+export function deleteRemnant(id: string): Remnant[] {
+  const list = loadRemnants().filter((r) => r.id !== id)
+  saveRemnants(list)
+  return list
+}
+
+export function newRemnantId(): string {
+  return `r${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`
 }

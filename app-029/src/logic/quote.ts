@@ -52,6 +52,12 @@ export function buildQuoteDoc(project: Project, layout: LayoutResult, bom: BomRe
     unitPrice: yuan(m.unitPriceCents),
     amount: yuan(m.amountCents)
   }))
+  const boardNote =
+    bom.board.kind === 'remnant'
+      ? `亚克力开料：余料 ${bom.board.remnant.wMm}×${bom.board.remnant.hMm}mm 1 块（来自「${bom.board.remnant.fromProjectName}」的整板边角），用掉 ${bom.board.usedAreaM2.toFixed(
+          3
+        )}㎡，按原整板单价摊分计 ¥${yuan(bom.board.costCents)}（不按整张板计）`
+      : `亚克力拼版：${bom.nesting.sheetCount} 张 ${bom.sheet.spec}，利用率 ${(bom.nesting.utilization * 100).toFixed(1)}%`
   return {
     title: '招牌字制作报价单',
     projectName: project.name,
@@ -66,7 +72,7 @@ export function buildQuoteDoc(project: Project, layout: LayoutResult, bom: BomRe
     total: yuan(bom.totalCents),
     notes: [
       `面板材料：${bom.panelMaterial.name}（${bom.panelMaterial.desc}）`,
-      `亚克力拼版：${bom.nesting.sheetCount} 张 ${bom.sheet.spec}，利用率 ${(bom.nesting.utilization * 100).toFixed(1)}%`,
+      boardNote,
       `LED：布点长度 ${bom.led.perimeterTotalMm}mm，模组 ${bom.led.modules} 只，额定功率 ${bom.led.ratedW}W，建议电源 ${bom.led.suggestedPsu}`,
       bom.led.note
     ].filter((s) => !!s),
@@ -156,9 +162,17 @@ export function exportProcessCardCsv(project: Project, layout: LayoutResult, bom
   lines.push(`建议电源,${bom.led.suggestedPsu}`)
   lines.push(`说明,${bom.led.note}`)
   lines.push('')
-  lines.push('亚克力拼版')
-  lines.push(`板材,${bom.sheet.spec}`)
-  lines.push(`板数,${bom.nesting.sheetCount}`)
-  lines.push(`利用率,${(bom.nesting.utilization * 100).toFixed(1)}%`)
+  lines.push('亚克力开料')
+  if (bom.board.kind === 'remnant') {
+    const r = bom.board.remnant
+    lines.push(`开料板材,余料 ${r.wMm}×${r.hMm}mm（来自「${r.fromProjectName}」第 ${r.fromSheetIndex + 1} 张板，位置 ${r.xOnSheet},${r.yOnSheet}）`)
+    lines.push(`原板规格,${bom.sheet.spec}`)
+    lines.push(`用掉面积㎡,${bom.board.usedAreaM2.toFixed(3)}`)
+    lines.push(`面板金额元,${yuan(bom.board.costCents)}（按用掉面积摊分，不按整张板）`)
+  } else {
+    lines.push(`板材,${bom.sheet.spec}`)
+    lines.push(`板数,${bom.nesting.sheetCount}`)
+    lines.push(`利用率,${(bom.nesting.utilization * 100).toFixed(1)}%`)
+  }
   download(`${project.name || '招牌'}工艺卡.csv`, new Blob([`\ufeff${lines.join('\n')}`], { type: 'text/csv;charset=utf-8' }))
 }

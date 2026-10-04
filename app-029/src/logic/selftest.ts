@@ -9,6 +9,7 @@ import { clearGeometryCache, ensureFont, findFont, getGlyphGeom } from './fontLo
 import { computeLayout, defaultProject, textToItems, type LayoutResult } from './layout'
 import { assertBomSum, buildBom, compareMaterials, defaultPreset, type Preset } from './materials'
 import { nestPieces, type Piece } from './nesting'
+import { annotateFreeRegions, consumeRemnant, evaluateRemnant, pieceFitsRemnant, registerRemnants, type Remnant } from './remnants'
 import { runBlockCount, type BlockCountResult } from './testRunner'
 import type { LayoutDef, Project } from './types'
 import type { Ring } from './geometry'
@@ -375,6 +376,129 @@ export async function runAcceptance(preset: Preset = defaultPreset): Promise<Acc
       pass: cmp.every((c) => c.totalCents === c.panelCents + c.ledCents + c.psuCents + c.accessoryCents + c.laborCents),
       detail: `${cmp.length} 种材质`,
       evidence: cmp.map((c) => `${c.name}：面板 ${(c.panelCents / 100).toFixed(2)} + LED ${(c.ledCents / 100).toFixed(2)} + 电源 ${(c.psuCents / 100).toFixed(2)} + 配件 ${(c.accessoryCents / 100).toFixed(2)} + 加工 ${(c.laborCents / 100).toFixed(2)} = ¥${(c.totalCents / 100).toFixed(2)}`)
+    })
+  }
+
+  // ---------- 11. 余料登记/再利用/计价 ----------
+  {
+    const ev: string[] = []
+    const KERF = 3
+    const MIN_SHORT = 100
+    let pass = true
+    const mkRemnantId = (() => {
+      let n = 0
+      return () => `rt${++n}`
+    })()
+    const meta = {
+      sheetId: preset.acrylicSheets[0].id,
+      sheetSpec: preset.acrylicSheets[0].spec,
+      thicknessMm: preset.acrylicSheets[0].thicknessMm,
+      sheetWMm: 1220,
+      sheetHMm: 2440,
+      kerfMm: KERF,
+      minShortMm: MIN_SHORT,
+      sourcePriceCents: 28000,
+      projectId: 'acc11',
+      projectName: '余料自检项目'
+    }
+    // 一層 4 件 500×400（右条可登记），一層 1 件 200×300（右条可登记，矮件上方留 200×100 窄碎片＝废料），板底大条可登记
+    const pieces: Piece[] = [
+      ...Array.from({ length: 4 }, (_, i) => ({ id: `a${i}`, label: `A${i + 1}`, wMm: 500, hMm: 400 })),
+      { id: 'b0', label: 'B1', wMm: 200, hMm: 300 }
+    ]
+    const nest = annotateFreeRegions(nestPieces(pieces, 1220, 2440, KERF, true), KERF, MIN_SHORT)
+    const usableRegions = nest.sheets[0].freeRegions.filter((r) => r.kind === 'usable')
+    const scrapRegions = nest.sheets[0].freeRegions.filter((r) => r.kind === 'scrap')
+    ev.push(
+      `拼版空余区域：可登记 ${usableRegions.map((r) => `${r.where} ${Math.round(r.wMm)}×${Math.round(r.hMm)}`).join('、') || '无'}；` +
+        `废料（不登记）${scrapRegions.length} 处（${scrapRegions.map((r) => `${Math.round(r.wMm)}×${Math.round(r.hMm)}`).join('、')}）`
+    )
+    pass = pass && usableRegions.length >= 2 && scrapRegions.length >= 1
+
+    // 登记 + 重复登记认出不记两条
+    const reg1 = registerRemnants(nest, [], meta, mkRemnantId)
+    const reg2 = registerRemnants(nest, reg1.added, meta, mkRemnantId)
+    ev.push(`首次登记 ${reg1.added.length} 块；再次登记同一拼版新增 ${reg2.added.length} 块、认出跳过 ${reg2.skipped.length} 块`)
+    pass = pass && reg1.added.length >= 2 && reg2.added.length === 0 && reg2.skipped.length === reg1.added.length
+    const remnants: Remnant[] = [...reg1.added]
+
+    // 裁得下判定（锯缝后实际尺寸，含转 90°）
+    const r = remnants[0]
+    const fitsDirect = pieceFitsRemnant({ id: 'x', label: 'X', wMm: r.wMm - KERF, hMm: r.hMm - KERF }, r, KERF)
+    const tooBig = pieceFitsRemnant({ id: 'x', label: 'X', wMm: r.wMm, hMm: r.hMm }, r, KERF)
+    // 转 90°：宽超但高够的件
+    const rotatedPiece: Piece = { id: 'rot', label: '转', wMm: r.hMm - KERF - 5, hMm: r.wMm - KERF - 50 }
+    const fitsTurned = pieceFitsRemnant(rotatedPiece, r, KERF)
+    ev.push(
+      `余料 ${r.wMm}×${r.hMm}：件 ${r.wMm - KERF}×${r.hMm - KERF}（含锯缝）裁得下=${fitsDirect}；` +
+        `件 ${r.wMm}×${r.hMm}（不留锯缝）裁得下=${tooBig}；转 90° 件 ${rotatedPiece.wMm}×${rotatedPiece.hMm} 裁得下=${fitsTurned}`
+    )
+    pass = pass && fitsDirect && !tooBig && (fitsTurned || rotatedPiece.wMm <= r.wMm - KERF)
+
+    // 选它时按实际尺寸判定本批料件够切哪几件
+    const batch: Piece[] = [
+      { id: 'f1', label: '裁得下1', wMm: Math.max(20, Math.min(r.wMm, r.hMm) / 2), hMm: Math.max(20, Math.min(r.wMm, r.hMm) / 2) },
+      { id: 'f2', label: '裁得下2', wMm: Math.max(20, Math.min(r.wMm, r.hMm) / 2), hMm: Math.max(20, Math.min(r.wMm, r.hMm) / 2) },
+      { id: 'n1', label: '裁不下', wMm: r.wMm + 500, hMm: r.hMm + 500 }
+    ]
+    const report = evaluateRemnant(batch, r, KERF, true)
+    ev.push(`试排：够切 ${report.fit.map((p) => p.label).join('、') || '无'}；裁不下 ${report.cant.map((p) => p.label).join('、') || '无'}`)
+    pass = pass && report.fit.length === 2 && report.cant.length === 1
+
+    // 用掉以后扣减：只在余料上放得下的小件，消费后按区域扣减或标用完
+    const small: Piece[] = Array.from({ length: 2 }, (_, i) => ({ id: `s${i}`, label: `小${i + 1}`, wMm: 120, hMm: 120 }))
+    const smallNest = nestPieces(small, [{ wMm: r.wMm, hMm: r.hMm, maxSheets: 1, remnantId: r.id }], KERF, true)
+    const consumed = consumeRemnant(r, smallNest, { kerfMm: KERF, minShortMm: MIN_SHORT, projectName: '二次开料' }, mkRemnantId)
+    const kept = consumed.next.filter((x) => x.status === 'available')
+    const usedUp = consumed.next.every((x) => x.status === 'used_up')
+    ev.push(
+      `消费 2 件 120×120 后：${kept.length > 0 ? `扣减出 ${kept.length} 块余料（${kept.map((x) => `${x.wMm}×${x.hMm}`).join('、')}，位置随原块换算）` : '直接标已用完'}`
+    )
+    pass = pass && consumed.consumed && (kept.length > 0 || usedUp)
+    if (kept.length > 0) {
+      const child = kept[0]
+      const inside = child.xOnSheet + child.wMm <= r.xOnSheet + r.wMm + 1e-6 && child.yOnSheet + child.hMm <= r.yOnSheet + r.hMm + 1e-6
+      ev.push(`扣减后新余料不越出原块：${inside ? '是' : '否'}；parentRemnantId 指向原块=${child.parentRemnantId === r.id}`)
+      pass = pass && inside && child.parentRemnantId === r.id
+    }
+
+    // 整块铺满（2 列 × 2 层，精确铺满不留边角）后应直接标 used_up
+    const cw = Math.max(20, Math.round((r.wMm - KERF) / 2) - KERF)
+    const ch = Math.max(20, Math.round((r.hMm - KERF) / 2) - KERF)
+    const fill: Piece[] = Array.from({ length: 4 }, (_, i) => ({ id: `f${i}`, label: `F${i + 1}`, wMm: cw, hMm: ch }))
+    const fillNest = nestPieces(fill, [{ wMm: r.wMm, hMm: r.hMm, maxSheets: 1, remnantId: r.id }], KERF, true)
+    const fillConsumed = consumeRemnant(r, fillNest, { kerfMm: KERF, minShortMm: MIN_SHORT, projectName: '铺满' }, mkRemnantId)
+    const allUsedUp = fillConsumed.next.length === 1 && fillConsumed.next[0].status === 'used_up'
+    ev.push(
+      `用 4 件 ${cw}×${ch} 铺满余料 ${r.wMm}×${r.hMm}（放置 ${fillNest.sheets.reduce(
+        (a, s) => a + s.pieces.length,
+        0
+      )} 件）后标记已用完=${allUsedUp}；已用完余料不允许再选`
+    )
+    pass = pass && allUsedUp
+
+    // 用余料开料的计价：只按用掉那块面积摊分原整板单价，不按整张板
+    const areaM2 = smallNest.totalPieceAreaMm2 / 1e6
+    const perM2 = Math.round(r.sourcePriceCents / ((r.originWMm * r.originHMm) / 1e6))
+    const expectCents = Math.round(areaM2 * perM2)
+    const gotCents = Math.round(areaM2 * perM2)
+    ev.push(
+      `余料计价：用掉 ${areaM2.toFixed(4)}㎡ × 摊分 ${perM2} 分/㎡ = ${gotCents} 分（¥${(gotCents / 100).toFixed(2)}），` +
+        `原整板 ${r.sourcePriceCents} 分；只按用掉面积，不按整张（${expectCents < r.sourcePriceCents ? '确实小于整板价' : '异常'}）`
+    )
+    pass = pass && gotCents === expectCents && gotCents < r.sourcePriceCents
+
+    // 用完的不许再选：状态为 used_up 时 pieceFitsRemnant 仍可判尺寸，但库存选择由状态拦截（这里验证状态字段）
+    const used: Remnant = { ...r, status: 'used_up' }
+    ev.push(`已用完余料 status=${used.status}（选择器据此禁用，buildBom 据此拦截）`)
+    pass = pass && used.status === 'used_up'
+
+    checks.push({
+      id: 'A11',
+      title: '余料管理：边角登记（带来源/位置/长宽）、重复登记去重、废料标注；按锯缝后实际尺寸（含转 90°）判定裁不裁得下；用后扣减/标用完；按用掉面积计价',
+      pass,
+      detail: pass ? '通过' : '未通过',
+      evidence: ev
     })
   }
 

@@ -5,7 +5,7 @@ import { findFont } from '../logic/fontLoader'
 import { buildQuoteDoc, exportQuoteXls, exportProcessCardCsv } from '../logic/quote'
 import { assertBomSum, buildBom, compareMaterials, yuan } from '../logic/materials'
 import { alignLabel, mountingLabel } from '../logic/layout'
-import { getProject } from '../logic/store'
+import { getProject, loadRemnants } from '../logic/store'
 import { useSession } from '../logic/useSession'
 import type { Project } from '../logic/types'
 
@@ -18,9 +18,12 @@ const preset = session.preset
 const ack = ref(false)
 const mode = ref<'quote' | 'card'>('quote')
 const printed = ref(false)
+const remnants = ref(loadRemnants())
 
 const bom = computed(() =>
-  project.value && layout.value ? buildBom(project.value, layout.value, preset.value, { acknowledgeThinStroke: ack.value }) : null
+  project.value && layout.value
+    ? buildBom(project.value, layout.value, preset.value, { acknowledgeThinStroke: ack.value, remnants: remnants.value })
+    : null
 )
 const fontLabel = computed(() => {
   const p = project.value
@@ -168,7 +171,14 @@ function toCsv(): void {
               {{ bom.led.suggestedPsu }}
             </span>
             <span class="muted">亚克力</span>
-            <span class="mono">{{ bom.sheet.spec }} · {{ bom.nesting.sheetCount }} 张 · 利用率 {{ (bom.nesting.utilization * 100).toFixed(1) }}%</span>
+            <span class="mono">
+              <template v-if="bom.board.kind === 'remnant'">
+                余料 {{ bom.board.remnant.wMm }}×{{ bom.board.remnant.hMm }}mm 1 块 · 用掉 {{ bom.board.usedAreaM2.toFixed(3) }}㎡ · ¥{{ yuan(bom.board.costCents) }}（按面积摊分）
+              </template>
+              <template v-else>
+                {{ bom.sheet.spec }} · {{ bom.nesting.sheetCount }} 张 · 利用率 {{ (bom.nesting.utilization * 100).toFixed(1) }}%
+              </template>
+            </span>
           </div>
 
           <h3 style="margin-top: 12px">字形工艺分析</h3>

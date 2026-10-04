@@ -9,6 +9,7 @@ import materialsData from '../data/materials.json'
 import type { LedResult, Material, Project } from './types'
 import type { LayoutResult, PlacedChar } from './layout'
 import { nestPieces, type CutItem, type NestingResult, type Piece } from './nesting'
+import { remnantCostCents, type Remnant } from './remnants'
 import { computeLed, type PsuPreset } from './led'
 
 export interface SheetSpec {
@@ -75,6 +76,8 @@ export interface Preset {
     maxTrackMm: number
     warnTrackRatioLow: number
     warnTrackRatioHigh: number
+    /** 余料登记门槛：空余区域短边 ≥ 该值才登记（mm），太窄太碎的只标废料 */
+    remnantMinShortMm: number
   }
   acrylicSheets: SheetSpec[]
   ledModules: LedModuleSpec[]
@@ -100,11 +103,32 @@ export interface BomResult {
   blocked: boolean
   blockReasons: string[]
   panelMaterial: PanelMaterialSpec
+  /** 本次开料用的板材：整板或余料 */
+  board: BoardSource
+  /** 面板材料金额（分）：整板按张、余料按用掉面积摊分 */
+  acrylicCents: number
+}
+
+/** 开料板材来源：整板（按张计）或余料（按用掉面积摊分原板单价） */
+export type BoardSource =
+  | { kind: 'sheet'; sheet: SheetSpec }
+  | { kind: 'remnant'; remnant: Remnant; sheet: SheetSpec; usedAreaM2: number; costCents: number }
+
+export const REMNANT_PREFIX = 'remnant:'
+
+export function isRemnantSheetId(sheetId: string): boolean {
+  return sheetId.startsWith(REMNANT_PREFIX)
+}
+
+export function remnantIdFromSheetId(sheetId: string): string {
+  return sheetId.slice(REMNANT_PREFIX.length)
 }
 
 export interface BomOptions {
   /** 已确认「最细笔画低于工艺下限」的风险 */
   acknowledgeThinStroke?: boolean
+  /** 可选余料库存（project.sheetId 为 remnant:xxx 时使用，默认空） */
+  remnants?: Remnant[]
 }
 
 function ruleQty(rule: RuleSpec, ctx: { areaM2: number; chars: number; perimeterM: number; psu: number; modules: number; blocks: number; outlinePerimeterM: number }): number {
@@ -154,13 +178,38 @@ export function acrylicPieces(chars: PlacedChar[]): Piece[] {
 }
 
 export function buildBom(project: Project, layout: LayoutResult, preset: Preset, opts: BomOptions = {}): BomResult {
-  const sheet = preset.acrylicSheets.find((s) => s.id === project.sheetId) ?? preset.acrylicSheets[0]
+  const remnants = opts.remnants ?? []
+  const usingRemnant = isRemnantSheetId(project.sheetId)
+  const remnant = usingRemnant ? remnants.find((r) => r.id === remnantIdFromSheetId(project.sheetId)) : undefined
+  // 余料来源规格可能与当前默认板材不同：锯缝/单价以来源板材为准；余料失效则回退其来源整板
+  const sheet =
+    (remnant ? preset.acrylicSheets.find((s) => s.id === remnant.sheetId) : undefined) ??
+    preset.acrylicSheets.find((s) => s.id === project.sheetId) ??
+    preset.acrylicSheets[0]
   const module = preset.ledModules.find((m) => m.id === project.ledModuleId) ?? preset.ledModules[0]
   const panelMaterial = preset.panelMaterials.find((m) => m.id === project.panelMaterialId) ?? preset.panelMaterials[0]
   const led = computeLed(layout.ledLengthMm, project.led, preset.psu)
 
   const pieces = acrylicPieces(layout.chars)
-  const nesting = nestPieces(pieces, sheet.wMm, sheet.hMm, sheet.kerfMm, true)
+
+  // 余料开料：按余料实际尺寸（锯缝后）判定，一块余料只开 1 张，放不下的件不允许偷用新板
+  let nesting: NestingResult
+  let board: BoardSource
+  // 选中的余料已用完或已被删除：不许再选，拦截提示（回退整板仅用于展示数值，不放行报价）
+  const remnantInvalid = usingRemnant && !(remnant && remnant.status === 'available')
+  if (usingRemnant && remnant && remnant.status === 'available') {
+    nesting = nestPieces(pieces, [{ wMm: remnant.wMm, hMm: remnant.hMm, maxSheets: 1, remnantId: remnant.id }], sheet.kerfMm, true)
+    board = {
+      kind: 'remnant',
+      remnant,
+      sheet,
+      usedAreaM2: nesting.totalPieceAreaMm2 / 1e6,
+      costCents: remnantCostCents(remnant, nesting)
+    }
+  } else {
+    nesting = nestPieces(pieces, sheet.wMm, sheet.hMm, sheet.kerfMm, true)
+    board = { kind: 'sheet', sheet }
+  }
   const pieceAreaM2 = nesting.totalPieceAreaMm2 / 1e6
   const outerPerimeterMm = layout.chars.reduce((s, c) => {
     const k = c.geom.inkW > 0 ? c.inkW / c.geom.inkW : 0
@@ -186,15 +235,32 @@ export function buildBom(project: Project, layout: LayoutResult, preset: Preset,
   }
 
   const materials: Material[] = []
-  // 1) 亚克力面板（按板计）
-  materials.push({
-    kind: 'acrylic',
-    spec: sheet.spec,
-    qty: nesting.sheetCount,
-    unit: '张',
-    unitPriceCents: sheet.priceCents,
-    amountCents: nesting.sheetCount * sheet.priceCents
-  })
+  // 1) 亚克力面板：整板按整张计；用余料开出来的部分只按用掉那块的面积摊分计，不按整张板
+  let acrylicCents = 0
+  if (board.kind === 'sheet') {
+    acrylicCents = nesting.sheetCount * sheet.priceCents
+    materials.push({
+      kind: 'acrylic',
+      spec: sheet.spec,
+      qty: nesting.sheetCount,
+      unit: '张',
+      unitPriceCents: sheet.priceCents,
+      amountCents: acrylicCents
+    })
+  } else {
+    const r = board.remnant
+    const areaM2 = board.usedAreaM2
+    const perM2 = areaM2 > 0 ? Math.round(board.costCents / areaM2) : 0
+    acrylicCents = board.costCents
+    materials.push({
+      kind: 'acrylic',
+      spec: `${sheet.spec}｜余料开料（用掉 ${areaM2.toFixed(3)}㎡，来自 ${board.remnant.fromProjectName} 的余料 ${r.wMm}×${r.hMm}mm）`,
+      qty: Math.round(areaM2 * 1000) / 1000,
+      unit: '㎡',
+      unitPriceCents: perM2,
+      amountCents: acrylicCents
+    })
+  }
   // 2) LED 模组
   if (panelMaterial.useLed) {
     materials.push({
@@ -266,11 +332,18 @@ export function buildBom(project: Project, layout: LayoutResult, preset: Preset,
 
   const totalCents = materials.reduce((s, m) => s + m.amountCents, 0)
   const thin = layout.glyphs.filter((g) => !g.missing && g.minStrokeMm > 0 && g.minStrokeMm < project.layout.settings.strokeLimitMm)
+  const boardName = board.kind === 'sheet' ? `${sheet.wMm}×${sheet.hMm}mm` : `余料 ${board.remnant.wMm}×${board.remnant.hMm}mm`
   const blockReasons = [
     ...thin.map((g) => `「${g.char}」最细笔画 ${g.minStrokeMm}mm < 工艺下限 ${project.layout.settings.strokeLimitMm}mm`),
-    ...nesting.oversize.map((p) => `料件「${p.label}」${p.wMm}×${p.hMm}mm 超过板材尺寸 ${sheet.wMm}×${sheet.hMm}mm`)
+    ...(remnantInvalid ? ['选中的余料已用完或已删除，不能再选，请改选整板或其它余料'] : []),
+    ...nesting.oversize.map((p) => `料件「${p.label}」${p.wMm}×${p.hMm}mm 超过板材尺寸 ${boardName}（含锯缝 ${sheet.kerfMm}mm，正放与转 90° 均裁不下）`),
+    ...nesting.unplaced.map((p) => `料件「${p.label}」${p.wMm}×${p.hMm}mm 在选中余料上排不下（一块余料只能开一次）`)
   ]
-  const blocked = (blockReasons.length > 0 && !opts.acknowledgeThinStroke) || nesting.oversize.length > 0
+  const blocked =
+    (blockReasons.length > 0 && !opts.acknowledgeThinStroke) ||
+    nesting.oversize.length > 0 ||
+    nesting.unplaced.length > 0 ||
+    remnantInvalid
 
   return {
     materials,
@@ -284,7 +357,9 @@ export function buildBom(project: Project, layout: LayoutResult, preset: Preset,
     outlinePerimeterM,
     blocked,
     blockReasons,
-    panelMaterial
+    panelMaterial,
+    board,
+    acrylicCents
   }
 }
 

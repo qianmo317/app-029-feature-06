@@ -90,6 +90,13 @@ function removeSheet(i: number): void {
           <label>默认铝塑板边框（mm）</label>
           <div class="ctl"><input type="number" v-model.number="preset.process.panelFrameMm" step="5" /></div>
         </div>
+        <div class="field">
+          <label>余料登记门槛（短边 mm）</label>
+          <div class="ctl">
+            <input type="number" v-model.number="preset.process.remnantMinShortMm" min="10" step="10" />
+            <span class="muted">板上边角短边 ≥ 此值才登记；更窄更碎的只在拼版图标废料</span>
+          </div>
+        </div>
 
         <h3 style="margin-top: 14px">亚克力板材</h3>
         <table>

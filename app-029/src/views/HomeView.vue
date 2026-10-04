@@ -6,7 +6,7 @@ import { computeLayout, mountingLabel, textToItems } from '../logic/layout'
 import { buildBom } from '../logic/materials'
 import { compareMaterials } from '../logic/materials'
 import { bomGroupLabel } from '../logic/quote'
-import { createProject, deleteProject, duplicateProject, listProjects, loadPreset, loadPrefs, saveProject } from '../logic/store'
+import { createProject, deleteProject, duplicateProject, listProjects, loadPreset, loadPrefs, loadRemnants, saveProject } from '../logic/store'
 import type { Align, Mounting, Project } from '../logic/types'
 import { yuan } from '../logic/materials'
 
@@ -14,6 +14,7 @@ const router = useRouter()
 const projects = ref<Project[]>([])
 const preset = ref(loadPreset())
 const prefs = loadPrefs()
+const remnants = ref(loadRemnants())
 const error = ref('')
 const batchTick = ref(0)
 const selected = ref<string[]>([])
@@ -125,15 +126,23 @@ const batchRows = computed(() => {
   void batchTick.value
   return selectedProjects.value.map((p) => {
     const lay = computeLayout(p.layout)
-    const bom = buildBom(p, lay, preset.value)
+    const bom = buildBom(p, lay, preset.value, { remnants: remnants.value })
     return { project: p, layout: lay, bom }
   })
 })
 
+function boardDesc(bom: ReturnType<typeof buildBom>): string {
+  return bom.board.kind === 'remnant'
+    ? `余料1块/${bom.board.usedAreaM2.toFixed(2)}㎡`
+    : `${bom.nesting.sheetCount} 张`
+}
+
 const batchTotal = computed(() => {
   const rows = batchRows.value
   return {
-    sheets: rows.reduce((s, r) => s + r.bom.nesting.sheetCount, 0),
+    // 整板按张、余料按块（1 块）分别列示
+    fullSheets: rows.filter((r) => r.bom.board.kind === 'sheet').reduce((s, r) => s + r.bom.nesting.sheetCount, 0),
+    remnantBlocks: rows.filter((r) => r.bom.board.kind === 'remnant').length,
     modules: rows.reduce((s, r) => s + r.bom.led.modules, 0),
     psus: rows.reduce((s, r) => s + r.bom.led.psuCount, 0),
     cents: rows.reduce((s, r) => s + r.bom.totalCents, 0),
@@ -323,7 +332,7 @@ function applyUnified(): void {
               <td class="num">{{ r.project.layout.items.length }}</td>
               <td class="num">{{ r.layout.sizeMm }}</td>
               <td class="num">{{ r.layout.occupiedW }}</td>
-              <td class="num">{{ r.bom.nesting.sheetCount }} 张</td>
+              <td class="num">{{ boardDesc(r.bom) }}</td>
               <td class="num">{{ r.bom.led.modules }}</td>
               <td class="num">{{ r.bom.led.psuCount }}</td>
               <td class="num">{{ (r.bom.nesting.utilization * 100).toFixed(1) }}%</td>
@@ -336,7 +345,7 @@ function applyUnified(): void {
               <td class="num">{{ batchTotal.chars }}</td>
               <td class="num"></td>
               <td class="num"></td>
-              <td class="num">{{ batchTotal.sheets }} 张</td>
+              <td class="num">整板 {{ batchTotal.fullSheets }} 张<template v-if="batchTotal.remnantBlocks"> / 余料 {{ batchTotal.remnantBlocks }} 块</template></td>
               <td class="num">{{ batchTotal.modules }}</td>
               <td class="num">{{ batchTotal.psus }}</td>
               <td class="num"></td>
